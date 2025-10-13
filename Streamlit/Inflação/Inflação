@@ -1,0 +1,308 @@
+# streamlit_food_price_forecast.py
+# Aplicação Streamlit para previsão de preços de alimentos baseada em séries temporais
+# Espera-se um CSV com colunas mínimas: ['date'/'Date' (datas), 'food'/'item' (nome do alimento), 'country'/'Country', 'price'/'Price'],
+# e, se existir, uma coluna de inflação (ex: 'inflation' em % ou decimal) por período.
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import plotly.graph_objects as go
+import plotly.express as px
+import os
+
+# Model libs
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except Exception:
+    PROPHET_AVAILABLE = False
+
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+st.set_page_config(page_title="Food Price Forecast", layout="wide")
+
+st.title("Previsão de Preços de Alimentos — Série Temporal + Inflação")
+st.markdown(
+    "Esta aplicação faz previsão de preços de um alimento com base em séries históricas e dados de inflação (se houver no dataset)."
+)
+
+# Path default (for this environment) - altere se necessário
+st.sidebar.header("Upload de Dataset")
+uploaded = st.sidebar.file_uploader("Carregue o arquivo CSV com dados históricos de preços e inflação", type=['csv'])
+if uploaded is None:
+    st.sidebar.warning("Por favor, carregue um arquivo CSV para continuar.")
+    st.stop()
+
+
+df_raw = pd.read_csv(uploaded)
+
+@st.cache_data
+def load_csv(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+    df = pd.read_csv(path)
+    return df
+
+
+def preprocess(df: pd.DataFrame):
+    d = df.copy()
+    # normalize column names to lowercase
+    d.columns = [c.strip().lower() for c in d.columns]
+
+    # try to find date column
+    date_cols = [c for c in d.columns if "date" in c or "month" in c or "period" in c]
+    if not date_cols:
+        raise ValueError("Nenhuma coluna de data encontrada no CSV. Renomeie a coluna de datas para 'date' ou similar.")
+    date_col = date_cols[0]
+    d[date_col] = pd.to_datetime(d[date_col], errors='coerce')
+    d = d.dropna(subset=[date_col])
+    d = d.sort_values(date_col)
+    d = d.rename(columns={date_col: 'date'})
+
+    # find price column
+    price_cols = [c for c in d.columns if 'price' in c or 'valor' in c or 'price' == c]
+    if not price_cols:
+        # assume there's a numeric column that looks like price
+        numeric_cols = d.select_dtypes(include=[np.number]).columns.tolist()
+        if not numeric_cols:
+            raise ValueError("Nenhuma coluna de preços encontrada no CSV.")
+        price_col = numeric_cols[0]
+    else:
+        price_col = price_cols[0]
+
+    d = d.rename(columns={price_col: 'price'})
+
+    # find food and country columns
+    food_cols = [c for c in d.columns if c in ['food', 'item', 'product', 'commodity', 'alimento', 'produto'] or 'food' in c or 'item' in c]
+    country_cols = [c for c in d.columns if c in ['country', 'pais', 'país', 'location'] or 'country' in c or 'pais' in c]
+
+    if food_cols:
+        d = d.rename(columns={food_cols[0]: 'food'})
+    else:
+        d['food'] = 'NA'  # fallback
+
+    if country_cols:
+        d = d.rename(columns={country_cols[0]: 'country'})
+    else:
+        d['country'] = 'NA'
+
+    # inflation column, optional
+    inflation_cols = [c for c in d.columns if 'inflation' in c or 'ipca' in c or 'cpi' in c]
+    if inflation_cols:
+        d = d.rename(columns={inflation_cols[0]: 'inflation'})
+        # try to coerce to monthly decimal (if percent, convert)
+        d['inflation'] = pd.to_numeric(d['inflation'], errors='coerce')
+    else:
+        d['inflation'] = np.nan
+
+    return d
+
+
+# Sidebar for file and inputs
+st.sidebar.header("Dados e Entradas")
+csv_path = st.sidebar.text_input("Caminho do CSV", value=DEFAULT_CSV_PATH)
+
+uploaded = st.sidebar.file_uploader("Ou faça upload do CSV", type=['csv'])
+if uploaded is not None:
+    df_raw = pd.read_csv(uploaded)
+else:
+    try:
+        df_raw = load_csv(csv_path)
+    except Exception as e:
+        st.sidebar.error(str(e))
+        st.stop()
+
+try:
+    df = preprocess(df_raw)
+except Exception as e:
+    st.error(f"Erro no pré-processamento: {e}")
+    st.stop()
+
+# Input fields: food, country, current price
+with st.sidebar.form("user_inputs"):
+    st.write("**Entradas do Usuário**")
+    food_in = st.text_input("Nome do alimento", value="Arroz")
+    country_in = st.text_input("País de origem", value="Brasil")
+    current_price = st.number_input("Preço atual do alimento (numérico)", min_value=0.0, value=25.0, format="%.2f")
+    months_forecast = st.number_input("Meses a projetar", min_value=1, max_value=60, value=12)
+    run_button = st.form_submit_button("Gerar previsão")
+
+if not run_button:
+    st.info("Preencha as entradas na barra lateral e clique em 'Gerar previsão' para iniciar.")
+    st.stop()
+
+# Input validation
+errors = []
+if not food_in or str(food_in).strip() == "":
+    errors.append("Nome do alimento não pode estar vazio.")
+if not country_in or str(country_in).strip() == "":
+    errors.append("País não pode estar vazio.")
+if current_price <= 0:
+    errors.append("Preço atual deve ser maior que zero.")
+if months_forecast < 1:
+    errors.append("Meses a projetar deve ser >= 1.")
+
+if errors:
+    for e in errors:
+        st.error(e)
+    st.stop()
+
+# Filter dataset by user selection (case-insensitive)
+mask_food = df['food'].astype(str).str.lower().str.contains(str(food_in).lower())
+mask_country = df['country'].astype(str).str.lower().str.contains(str(country_in).lower())
+sub = df[mask_food & mask_country].copy()
+
+if sub.empty:
+    st.warning("Nenhum histórico encontrado para os filtros (alimento/país). Usarei série agregada para o mesmo alimento em outros países, se disponível.")
+    sub = df[df['food'].astype(str).str.lower().str.contains(str(food_in).lower())].copy()
+
+if sub.empty:
+    st.warning("Ainda assim sem dados. Vou usar dados agregados do arquivo (média por mês) para fins de demonstração.")
+    # aggregate by month
+    tmp = df.copy()
+    tmp['date'] = pd.to_datetime(tmp['date'])
+    tmp = tmp.set_index('date').resample('M').mean().reset_index()
+    sub = tmp[['date', 'price', 'inflation']].copy()
+else:
+    sub = sub[['date', 'price', 'inflation']].copy()
+
+# Prepare series: aggregate monthly
+sub['date'] = pd.to_datetime(sub['date'])
+sub = sub.set_index('date').resample('M').mean().reset_index()
+sub = sub.dropna(subset=['price'])
+
+if len(sub) < 6:
+    st.warning(f"Poucos pontos históricos ({len(sub)}). Modelo estatístico pode ser impreciso.")
+
+# show historical table and plot
+st.subheader("Série histórica (média mensal)")
+with st.expander("Dados históricos" , expanded=False):
+    st.dataframe(sub.tail(200))
+
+fig_hist = px.line(sub, x='date', y='price', title='Preço histórico (média mensal)')
+st.plotly_chart(fig_hist, use_container_width=True)
+
+# Forecast approaches:
+# 1) Prophet (if available) using inflation as regressor
+# 2) ExponentialSmoothing (Holt-Winters) as fallback
+# 3) Naive inflation-based projection using current price
+
+# Build Model + Forecast
+future_idx = pd.date_range(start=sub['date'].max() + pd.offsets.MonthBegin(1), periods=months_forecast, freq='M')
+
+forecast_df = None
+method_used = None
+
+# Try Prophet first
+if PROPHET_AVAILABLE and len(sub) >= 12:
+    try:
+        st.info("Usando Prophet para previsão (inclui inflação quando disponível).")
+        df_prop = sub[['date', 'price', 'inflation']].rename(columns={'date': 'ds', 'price': 'y'})
+        m = Prophet(interval_width=0.95)
+        if 'inflation' in df_prop.columns and not df_prop['inflation'].isna().all():
+            m.add_regressor('inflation')
+        m.fit(df_prop)
+        future = pd.DataFrame({'ds': list(pd.to_datetime(df_prop['ds']).tolist()) + list(future_idx)})
+        # add inflation regressor to future if available: use mean historical inflation for future
+        if 'inflation' in df_prop.columns and not df_prop['inflation'].isna().all():
+            mean_inf = df_prop['inflation'].mean()
+            # build inflation series for future: last known values then mean
+            past_inf = df_prop['inflation'].tolist()
+            future_inf = past_inf + [mean_inf] * len(future_idx)
+            future['inflation'] = future_inf
+        forecast = m.predict(future)
+        # take only future period
+        forecast_df = forecast[forecast['ds'].isin(future_idx)][['ds', 'yhat', 'yhat_lower', 'yhat_upper']].rename(columns={'ds': 'date'})
+        method_used = 'prophet'
+    except Exception as e:
+        st.warning(f"Prophet falhou: {e} — caindo para ExponentialSmoothing.")
+        forecast_df = None
+
+# Fallback: ExponentialSmoothing on price series
+if forecast_df is None:
+    try:
+        st.info("Usando ExponentialSmoothing (Holt-Winters) como fallback.")
+        series = sub.set_index('date')['price']
+        # seasonal if >= 24 points
+        seasonal = 'add' if len(series) >= 24 else None
+        model = ExponentialSmoothing(series, trend='add', seasonal=seasonal, seasonal_periods=12 if seasonal else None)
+        fit = model.fit(optimized=True)
+        pred = fit.forecast(months_forecast)
+        idx = pred.index
+        forecast_df = pd.DataFrame({'date': idx, 'yhat': pred.values})
+        # approximate confidence with simple stdev
+        resid = fit.resid
+        se = resid.std()
+        forecast_df['yhat_lower'] = forecast_df['yhat'] - 1.96 * se
+        forecast_df['yhat_upper'] = forecast_df['yhat'] + 1.96 * se
+        method_used = 'holtwinters'
+    except Exception as e:
+        st.error(f"ExponentialSmoothing falhou: {e}")
+        forecast_df = None
+
+# Naive inflation-based projection from current price
+inflation_projection = None
+if not sub['inflation'].isna().all():
+    avg_monthly_inf = sub['inflation'].mean()
+    # if inflation in percent (e.g., 2.5) assume percent and convert
+    if abs(avg_monthly_inf) > 1.5:  # heuristic: >150% monthly looks like percent-values
+        avg_monthly_inf = avg_monthly_inf / 100.0
+    prices = [current_price * ((1 + avg_monthly_inf) ** (i+1)) for i in range(months_forecast)]
+    inflation_projection = pd.DataFrame({'date': future_idx, 'inflation_proj': prices})
+
+# Combine historical + forecast for plotting
+plot_df = pd.concat([
+    sub[['date', 'price']].rename(columns={'price': 'value'}),
+    forecast_df.rename(columns={'yhat': 'value'})[['date', 'value', 'yhat_lower' if 'yhat_lower' in forecast_df.columns else 'value', 'yhat_upper' if 'yhat_upper' in forecast_df.columns else 'value']].rename(columns={
+        'yhat_lower': 'lower', 'yhat_upper': 'upper'
+    })] if forecast_df is not None else [] ,
+    ignore_index=True)
+
+# Build a robust plot using Plotly: history + forecast + confidence
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=sub['date'], y=sub['price'], mode='lines+markers', name='Histórico'))
+if forecast_df is not None:
+    fig.add_trace(go.Scatter(x=forecast_df['date'], y=forecast_df['yhat'], mode='lines+markers', name='Previsão'))
+    if 'yhat_lower' in forecast_df.columns and 'yhat_upper' in forecast_df.columns:
+        fig.add_trace(go.Scatter(
+            x=pd.concat([forecast_df['date'], forecast_df['date'][::-1]]),
+            y=pd.concat([forecast_df['yhat_upper'], forecast_df['yhat_lower'][::-1]]),
+            fill='toself', name='Intervalo de confiança 95%', showlegend=True, line=dict(color='rgba(255,255,255,0)')
+        ))
+
+if inflation_projection is not None:
+    fig.add_trace(go.Scatter(x=inflation_projection['date'], y=inflation_projection['inflation_proj'], mode='lines', name='Projeção por inflação'))
+
+fig.update_layout(title=f"Projeção de preço para '{food_in}' — {country_in} (método: {method_used})",
+                  xaxis_title='Data', yaxis_title='Preço')
+
+st.plotly_chart(fig, use_container_width=True)
+
+# Show numeric forecast table
+if forecast_df is not None:
+    st.subheader("Tabela de previsão")
+    st.dataframe(forecast_df.set_index('date').round(2))
+
+# Show naive inflation projection table
+if inflation_projection is not None:
+    with st.expander("Projeção simples baseada na inflação média histórica"):
+        st.dataframe(inflation_projection.set_index('date').round(2))
+
+# Quick summary metrics
+st.subheader("Resumo")
+col1, col2 = st.columns(2)
+
+with col1:
+    st.metric("Última data histórica", sub['date'].max().date())
+    st.metric("Pontos históricos", len(sub))
+
+with col2:
+    st.metric("Método usado", method_used)
+    if inflation_projection is not None:
+        st.metric("Inflação mensal média (estim.)", f"{avg_monthly_inf:.4f}" )
+
+st.markdown("---")
+st.markdown("**Instalação / execução**: `pip install streamlit pandas plotly prophet statsmodels` (Prophet é opcional).\nExecutar: `streamlit run streamlit_food_price_forecast.py` e garanta que o CSV esteja acessível no caminho configurado.")
+
+st.markdown("**Observações**: modelos estatísticos têm limitações — verifique os dados de entrada, sazonalidade e consistência. Se não houver coluna de inflação no CSV, a projeção por inflação não será exibida.")
